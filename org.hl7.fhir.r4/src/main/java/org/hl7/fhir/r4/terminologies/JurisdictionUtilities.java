@@ -48,7 +48,7 @@ public class JurisdictionUtilities {
         "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO", "TR",
         "TT", "TV", "TW", "TZ", "UA", "UG", "UM", "US", "UY",
         "UZ", "VA", "VC", "VE", "VG", "VI", "VN", "VU", "WF",
-        "WS", "YE", "YT", "ZA", "ZM", "ZW"
+        "WS", "XX", "XY", "YE", "YT", "ZA", "ZM", "ZW"
         )) {
       return "urn:iso:std:iso:3166#"+s.toUpperCase(); 
     } else {
@@ -5975,7 +5975,11 @@ public class JurisdictionUtilities {
     case "876": return "Wallis and Futuna";
     case "882": return "Samoa";
     case "887": return "Yemen";
-    case "894": return "Zambia";  
+    case "894": return "Zambia";
+
+    // User-assigned codes (ISO 3166-1 reserves AA, QM-QZ, XA-XZ, ZZ for user assignment)
+    case "XX": return "Unknown or Unspecified Country";
+    case "XY": return "Anonymous Country";
     }
     return "Unknown country code '"+c.getCode()+"'";
   }

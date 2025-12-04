@@ -121,6 +121,7 @@ import org.hl7.fhir.r5.renderers.OperationOutcomeRenderer;
 import org.hl7.fhir.r5.terminologies.CodeSystemUtilities;
 import org.hl7.fhir.r5.terminologies.ImplicitValueSets;
 import org.hl7.fhir.r5.terminologies.ValueSetUtilities;
+import org.hl7.fhir.r5.terminologies.providers.ISO3166CodeSystem;
 import org.hl7.fhir.r5.terminologies.client.TerminologyClientContext;
 import org.hl7.fhir.r5.terminologies.client.TerminologyClientManager;
 import org.hl7.fhir.r5.terminologies.client.TerminologyClientR5;
@@ -1567,6 +1568,19 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       res.setDiagnostics("Local Warning: "+localWarning.trim()+". Server Error: "+res.getMessage());
       return res;
     }
+
+    // Handle ISO 3166-1 user-assigned codes (AA, QM-QZ, XA-XZ, ZZ)
+    // These codes are reserved for user assignment per ISO 3166-1 and may not be
+    // recognized by the terminology server, but should be accepted as valid codes.
+    if (!res.isOk() && "urn:iso:std:iso:3166".equals(code.getSystem()) &&
+        ISO3166CodeSystem.isUserAssignedCode(code.getCode())) {
+      ISO3166CodeSystem iso = new ISO3166CodeSystem();
+      ConceptDefinitionComponent cdc = iso.findConcept(code);
+      if (cdc != null) {
+        res = new ValidationResult(code.getSystem(), null, cdc, cdc.getDisplay());
+      }
+    }
+
     updateUnsupportedCodeSystems(res, code, codeKey);
     if (cachingAllowed && txCache != null) { // we never cache unsupported code systems - we always keep trying (but only once per run)
       txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT);

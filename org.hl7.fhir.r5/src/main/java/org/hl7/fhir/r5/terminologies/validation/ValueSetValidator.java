@@ -64,6 +64,7 @@ import org.hl7.fhir.r5.terminologies.CodeSystemUtilities;
 import org.hl7.fhir.r5.terminologies.client.TerminologyClientManager;
 import org.hl7.fhir.r5.terminologies.expansion.ValueSetExpansionOutcome;
 import org.hl7.fhir.r5.terminologies.providers.CodeSystemProvider;
+import org.hl7.fhir.r5.terminologies.providers.ISO3166CodeSystem;
 import org.hl7.fhir.r5.terminologies.providers.SpecialCodeSystem;
 import org.hl7.fhir.r5.terminologies.providers.URICodeSystem;
 import org.hl7.fhir.r5.terminologies.utilities.*;
@@ -1214,7 +1215,7 @@ public class ValueSetValidator extends ValueSetProcessBase {
   }
 
   private ConceptDefinitionComponent findSpecialConcept(Coding c, CodeSystem cs) {
-    // handling weird special cases in v2 code systems 
+    // handling weird special cases in v2 code systems
     if ("http://terminology.hl7.org/CodeSystem/v2-0203".equals(cs.getUrl())) {
       String code = c.getCode();
       if (code != null && code.startsWith("NN") && code.length() > 3) {
@@ -1222,10 +1223,19 @@ public class ValueSetValidator extends ValueSetProcessBase {
         if (cd != null) {
           return new ConceptDefinitionComponent(code).setDisplay("National Identifier for "+cd.getDisplay());
         }
-      }      
+      }
     }
 //    0396: HL7nnnn, IBTnnnn, ISOnnnn, X12Dennnn, 99zzz
 //    0335: PRNxxx
+
+    // Handle ISO 3166-1 user-assigned codes (AA, QM-QZ, XA-XZ, ZZ)
+    if ("urn:iso:std:iso:3166".equals(cs.getUrl())) {
+      if (ISO3166CodeSystem.isUserAssignedCode(c.getCode())) {
+        ISO3166CodeSystem iso = new ISO3166CodeSystem();
+        return iso.findConcept(c);
+      }
+    }
+
     return null;
   }
 

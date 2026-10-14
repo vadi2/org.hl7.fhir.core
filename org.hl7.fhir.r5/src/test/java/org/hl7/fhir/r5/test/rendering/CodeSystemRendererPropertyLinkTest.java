@@ -63,7 +63,8 @@ class CodeSystemRendererPropertyLinkTest {
   @MethodSource("hints")
   void urlPropertyIsLinkedUnlessNoLink(String hint, boolean linked) throws Exception {
     String html = render(hint);
-    String link = "<a href=\"" + PATIENT;
+    // a resolved url links to the resource page, with the versioned url as the title
+    String link = "title=\"" + PATIENT + "|";
     String code = "<code>" + PATIENT + "</code>";
     if (linked) {
       assertTrue(html.contains(link), "expected a link to " + PATIENT + ", but got: " + html);

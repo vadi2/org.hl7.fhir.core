@@ -82,8 +82,10 @@ class CodeSystemRendererPropertyLinkTest {
     String anchor = "<a href=\"#test-cs-a\">a</a>";
     if (linked) {
       assertTrue(html.contains(anchor), "expected the parent to link to its row, but got: " + html);
+      assertTrue(html.contains("<a name=\"test-cs-a\">"), "expected the row the parent links to, but got: " + html);
     } else {
       assertFalse(html.contains(anchor), "expected the parent as plain text, but got: " + html);
+      assertTrue(html.matches("(?s).*<td>\\s*a\\s*</td>.*"), "expected the parent as plain text, but got: " + html);
     }
   }
 

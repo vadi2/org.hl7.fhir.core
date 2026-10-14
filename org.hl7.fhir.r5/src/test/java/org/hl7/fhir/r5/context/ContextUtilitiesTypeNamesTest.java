@@ -21,7 +21,7 @@ import org.hl7.fhir.r5.model.StructureDefinition.TypeDerivationRule;
 import org.hl7.fhir.r5.test.utils.TestingUtilities;
 import org.hl7.fhir.utilities.Utilities;
 import org.hl7.fhir.utilities.VersionUtilities;
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 class ContextUtilitiesTypeNamesTest {
@@ -42,8 +42,8 @@ class ContextUtilitiesTypeNamesTest {
     }
   }
 
-  private static SimpleWorkerContext context;
-  private static CountingProxy constraint;
+  private SimpleWorkerContext context;
+  private CountingProxy constraint;
 
   private static StructureDefinition sd(String id, StructureDefinitionKind kind, TypeDerivationRule derivation, FHIRVersion version) {
     StructureDefinition sd = new StructureDefinition();
@@ -58,8 +58,8 @@ class ContextUtilitiesTypeNamesTest {
     return sd;
   }
 
-  @BeforeAll
-  static void setUp() throws IOException {
+  @BeforeEach
+  void setUp() throws IOException {
     context = new SimpleWorkerContext(TestingUtilities.getSharedWorkerContext());
     PackageInformation pi = new PackageInformation("example.type.names", "1.0.0", "5.0.0", new Date());
 

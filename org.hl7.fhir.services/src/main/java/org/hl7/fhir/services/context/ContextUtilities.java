@@ -67,6 +67,11 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
     this.suppressedMappings = suppressedMappings;
   }
 
+  /** true if the context has a listener, to be told about the lookups answered here from what was worked out before */
+  private boolean isListening() {
+    return context.getResourceReadListener() != null;
+  }
+
   @Deprecated
   public boolean isSuppressDebugMessages() {
     return false;
@@ -82,6 +87,12 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
       oid = oid.substring(8);
     }
     if (oidCache.containsKey(oid)) {
+      if (isListening()) {
+        // the context's listener is told what the answer was worked out from, as if it were worked out again
+        context.fetchCodeSystem("http://terminology.hl7.org/CodeSystem/v2-tables", VersionResolutionRules.defaultRule());
+        context.fetchResourcesByType(CodeSystem.class);
+        context.fetchResourcesByType(NamingSystem.class);
+      }
       return oidCache.get(oid);
     }
 
@@ -229,6 +240,9 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
    * @return a list of all structure definitions, with snapshots generated (if possible)
    */
   public List<StructureDefinition> allStructures() {
+    if (!allStructuresList.isEmpty() && isListening()) {
+      context.getResourceReadListener().resourcesRead("StructureDefinition", allStructuresList);
+    }
     if (allStructuresList.isEmpty()) {
       Set<StructureDefinition> set = new HashSet<StructureDefinition>();
       for (StructureDefinition sd : getStructures()) {

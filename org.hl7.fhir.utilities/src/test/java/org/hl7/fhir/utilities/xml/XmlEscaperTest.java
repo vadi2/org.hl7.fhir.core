@@ -12,10 +12,13 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Random;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
@@ -81,6 +84,19 @@ class XmlEscaperTest {
   void sameBytesAsEscapingOneCharacterAtATime(String input) throws IOException {
     byte[] bytes = input.getBytes(Charset.defaultCharset());
     assertArrayEquals(reference(bytes), escape(bytes));
+  }
+
+  // some of these are larger than the 8 KB output buffer and end with a write smaller than it, which
+  // is only on disk if the buffer is flushed
+  @ParameterizedTest
+  @MethodSource("inputs")
+  void convertsFiles(String input, @TempDir Path dir) throws IOException {
+    byte[] bytes = input.getBytes(Charset.defaultCharset());
+    Path source = dir.resolve("source.txt");
+    Path target = dir.resolve("target.txt");
+    Files.write(source, bytes);
+    XmlEscaper.convert(source.toString(), target.toString());
+    assertArrayEquals(reference(bytes), Files.readAllBytes(target));
   }
 
   @Test

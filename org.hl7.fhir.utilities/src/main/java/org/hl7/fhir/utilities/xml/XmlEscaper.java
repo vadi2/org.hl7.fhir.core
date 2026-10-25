@@ -1,8 +1,7 @@
 package org.hl7.fhir.utilities.xml;
 
+import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -35,11 +34,9 @@ public class XmlEscaper {
   }
   
   public static void convert(String source, String target) throws IOException {
-    FileOutputStream fs = ManagedFileAccess.outStream(target);
-    try {
-      convertAndClose(ManagedFileAccess.inStream(source), fs);
-    } finally {
-      fs.close();
+    try (InputStream input = ManagedFileAccess.inStream(source);
+         OutputStream output = new BufferedOutputStream(ManagedFileAccess.outStream(target))) {
+      convert(input, output);
     }
   }
   

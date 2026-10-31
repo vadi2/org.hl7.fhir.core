@@ -330,6 +330,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   protected ContextUtilities cutils;
   private List<String> suppressedMappings;
 
+  /** null unless someone is listening: a lookup checks this, and does nothing more when it's null */
+  private volatile IResourceReadListener resourceReadListener;
+
   protected BaseWorkerContext(IModelContext modelContext) throws FileNotFoundException, IOException, FHIRException {
     this.modelContext = modelContext;
     this.terminologyClientManager = new TerminologyClientManager(modelContext, new TerminologyClientR6.TerminologyClientR6Factory(), logger);
@@ -833,6 +836,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     CodeSystem cs = fetchCodeSystem(system, rules);
     if (cs != null) {
       List<CodeSystem> supplements = codeSystems.getSupplements(cs);
+      if (resourceReadListener != null) {
+        notifyResourcesRead(query("CodeSystem", "supplements=" + cs.getVersionedUrl()), supplements);
+      }
       if (supplements.size() > 0) {
         cs = CodeSystemUtilities.mergeSupplements(cs, supplements);
       }
@@ -845,6 +851,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     CodeSystem cs = fetchCodeSystem(system, rules, version, sourceOfReference);
     if (cs != null) {
       List<CodeSystem> supplements = codeSystems.getSupplements(cs);
+      if (resourceReadListener != null) {
+        notifyResourcesRead(query("CodeSystem", "supplements=" + cs.getVersionedUrl()), supplements);
+      }
       List<CodeSystem> activeSupplements = new ArrayList<>();
       for (CodeSystem c : supplements) {
         if (CodeSystemUtilities.isLangPack(c)) {
@@ -2628,8 +2637,16 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     return fetchResourceWithExceptionByVersion(class_, uri, rules, version, sourceForReference);
   }
 
-  @SuppressWarnings("unchecked")
   public <T extends Resource> T fetchResourceWithExceptionByVersion(Class<T> class_, String uri, VersionResolutionRules rules, String version, Resource sourceForReference) throws FHIRException {
+    T res = findResourceWithExceptionByVersion(class_, uri, rules, version, sourceForReference);
+    if (resourceReadListener != null) {
+      notifyResourceRead(typeName(class_), uri, version, res);
+    }
+    return res;
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends Resource> T findResourceWithExceptionByVersion(Class<T> class_, String uri, VersionResolutionRules rules, String version, Resource sourceForReference) throws FHIRException {
     if (uri == null) {
       return null;
     }
@@ -2906,8 +2923,16 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
   }
 
-  @SuppressWarnings("unchecked")
   public <T extends Resource> T fetchResourceWithExceptionByVersion(String cls, String uri, VersionResolutionRules rules, String version, CanonicalResource source) throws FHIRException {
+    T res = findResourceWithExceptionByVersion(cls, uri, rules, version, source);
+    if (resourceReadListener != null) {
+      notifyResourceRead(cls, uri, version, res);
+    }
+    return res;
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends Resource> T findResourceWithExceptionByVersion(String cls, String uri, VersionResolutionRules rules, String version, CanonicalResource source) throws FHIRException {
     if (uri == null) {
       return null;
     }
@@ -3048,12 +3073,59 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
   }
 
+  @Override
+  public IResourceReadListener getResourceReadListener() {
+    return resourceReadListener;
+  }
+
+  /**
+   * Sets (or, with null, clears) the listener told about every resource a lookup on this context returns: the
+   * fetchResource family, fetchResourcesByType and the other list and type lookups, and the lookups the context's
+   * {@link ContextUtilities} answers from what it worked out before. The listener is called on the thread that made
+   * the lookup. There's one listener at a time, and a copy of the context doesn't get it
+   */
+  public void setResourceReadListener(IResourceReadListener listener) {
+    this.resourceReadListener = listener;
+  }
+
+  /** tells the listener, if there is one, about a lookup of one resource */
+  protected void notifyResourceRead(String type, String canonical, String version, Resource result) {
+    IResourceReadListener l = resourceReadListener;
+    if (l != null) {
+      l.resourceRead(type, canonical, version, result);
+    }
+  }
+
+  /** tells the listener, if there is one, about a lookup that returned a list */
+  protected void notifyResourcesRead(String query, List<? extends Resource> result) {
+    IResourceReadListener l = resourceReadListener;
+    if (l != null) {
+      l.resourcesRead(query, result);
+    }
+  }
+
+  private static String typeName(Class<?> class_) {
+    return class_ == null || class_ == Resource.class || class_ == DomainResource.class || class_ == CanonicalResource.class ? null : class_.getSimpleName();
+  }
+
+  private static String query(String type, String filter) {
+    return (type == null ? "" : type) + (filter == null ? "" : "?" + filter);
+  }
+
   public <T extends Resource> List<T> fetchResourcesByType(Class<T> class_, FhirPublication fhirVersion) {
     return fetchResourcesByType(class_);
   }
 
-  @SuppressWarnings("unchecked")
   public <T extends Resource> List<T> fetchResourcesByType(Class<T> class_) {
+    List<T> res = findResourcesByType(class_);
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query(typeName(class_), null), res);
+    }
+    return res;
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends Resource> List<T> findResourcesByType(Class<T> class_) {
 
     List<T> res = new ArrayList<>();
 
@@ -3127,6 +3199,14 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   @Override
   public List<StructureDefinition> fetchSpecializations() {
+    List<StructureDefinition> res = findSpecializations();
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query("StructureDefinition", "derivation=specialization"), res);
+    }
+    return res;
+  }
+
+  private List<StructureDefinition> findSpecializations() {
     List<StructureDefinition> res = new ArrayList<>();
     synchronized (lock) {
       // the same resources in the same order as structures.getList(), but a definition that the package
@@ -3144,8 +3224,16 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     return res;
   }
 
-  @SuppressWarnings("unchecked")
   public <T extends Resource> List<T> fetchResourceVersionsByTypeAndUrl(Class<T> class_, String url) {
+    List<T> res = findResourceVersionsByTypeAndUrl(class_, url);
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query(typeName(class_), "url=" + url), res);
+    }
+    return res;
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends Resource> List<T> findResourceVersionsByTypeAndUrl(Class<T> class_, String url) {
 
     List<T> res = new ArrayList<>();
 
@@ -3215,6 +3303,14 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   @Override
   public Resource fetchResourceById(String type, String uri) {
+    Resource res = findResourceById(type, uri);
+    if (resourceReadListener != null) {
+      notifyResourceRead(type, uri, null, res);
+    }
+    return res;
+  }
+
+  private Resource findResourceById(String type, String uri) {
     synchronized (lock) {
       @SuppressWarnings("checkstyle:stringImplicitPatternUsage")
       //single literal character split
@@ -3502,6 +3598,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     synchronized (lock) {
       structures.listAll(m);
     }
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query("StructureDefinition", null), m);
+    }
     return m;
   }
 
@@ -3509,6 +3608,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     List<ValueSet> m = new ArrayList<ValueSet>();
     synchronized (lock) {
       valueSets.listAll(m);
+    }
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query("ValueSet", null), m);
     }
     return m;
   }
@@ -3518,13 +3620,21 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     synchronized (lock) {
       codeSystems.listAll(m);
     }
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query("CodeSystem", null), m);
+    }
     return m;
   }
 
   public StructureDefinition getStructure(String code) {
+    StructureDefinition res;
     synchronized (lock) {
-      return structures.get(code);
+      res = structures.get(code);
     }
+    if (resourceReadListener != null) {
+      notifyResourceRead("StructureDefinition", code, null, res);
+    }
+    return res;
   }
 
   @Override
@@ -3547,6 +3657,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
     StructureDefinition structureDefinition = typeManager.fetchTypeDefinition(typeName);
     generateSnapshot(structureDefinition, "5");
+    if (resourceReadListener != null) {
+      notifyResourceRead("StructureDefinition", typeName, null, structureDefinition);
+    }
     return structureDefinition;
   }
 
@@ -3575,7 +3688,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   @Override
   public List<StructureDefinition> fetchTypeDefinitions(String typeName) {
-    return typeManager.getDefinitions(typeName);
+    List<StructureDefinition> res = typeManager.getDefinitions(typeName);
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query("StructureDefinition", "type=" + typeName), res);
+    }
+    return res;
   }
 
   public boolean isPrimitiveType(String type) {
@@ -3682,6 +3799,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   public List<ImplementationGuide> allImplementationGuides() {
     List<ImplementationGuide> res = new ArrayList<>();
     guides.listAll(res);
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query("ImplementationGuide", null), res);
+    }
     return res;
   }
 
@@ -3932,6 +4052,14 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   }
 
   private <T extends Resource> T doFindTxResource(Class<T> class_, String canonical, VersionResolutionRules rules) {
+    T res = findTxResourceElsewhere(class_, canonical, rules);
+    if (resourceReadListener != null) {
+      notifyResourceRead(typeName(class_), canonical, null, res);
+    }
+    return res;
+  }
+
+  private <T extends Resource> T findTxResourceElsewhere(Class<T> class_, String canonical, VersionResolutionRules rules) {
     // well, we haven't found it locally. We're going look it up
     if (class_ == ValueSet.class) {
       ValueSet ivs = new ImplicitValueSets(getExpansionParameters()).generateImplicitValueSet(canonical);
@@ -4028,6 +4156,15 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   @Override
   public <T extends Resource> List<T> fetchResourceVersions(Class<T> class_, String uri) {
+    List<T> res = findResourceVersions(class_, uri);
+    if (resourceReadListener != null) {
+      notifyResourcesRead(query(typeName(class_), "url=" + uri), res);
+    }
+    return res;
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends Resource> List<T> findResourceVersions(Class<T> class_, String uri) {
     List<T> res = new ArrayList<>();
     if (uri != null && !uri.startsWith("#")) {
       if (class_ == StructureDefinition.class) {

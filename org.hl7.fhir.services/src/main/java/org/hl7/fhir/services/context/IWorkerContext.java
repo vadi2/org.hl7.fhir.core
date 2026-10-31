@@ -960,4 +960,14 @@ public interface IWorkerContext {
   @Deprecated
   public PEBuilder getProfiledElementBuilder(PEBuilder.PEElementPropertiesPolicy elementProps, boolean fixedProps);
 
+  /**
+   * The listener told about every resource a lookup on this context returns, if the context supports one and it has
+   * been given one. Code that answers a lookup from a memo of an earlier one tells it too.
+   *
+   * @return the listener, or null if there isn't one
+   */
+  public default IResourceReadListener getResourceReadListener() {
+    return null;
+  }
+
 }

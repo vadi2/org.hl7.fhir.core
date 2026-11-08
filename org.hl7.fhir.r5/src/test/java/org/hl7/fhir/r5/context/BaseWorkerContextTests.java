@@ -840,15 +840,28 @@ public class BaseWorkerContextTests {
    */
   @Test
   void cachedIncludeExpansionSeesRequiredSupplement() throws Exception {
+    assertCachedIncludeSeesSupplement("http://snomed.info/sct", new Parameters());
+  }
+
+  /** a supplement to one SNOMED CT edition is found through the system-version the expansion parameters pin */
+  @Test
+  void cachedIncludeExpansionSeesSupplementToPinnedVersion() throws Exception {
+    String edition = "http://snomed.info/sct|http://snomed.info/sct/900000000000207008/version/20250101";
+    Parameters params = new Parameters();
+    params.addParameter("system-version", new CanonicalType(edition));
+    assertCachedIncludeSeesSupplement(edition, params);
+  }
+
+  private void assertCachedIncludeSeesSupplement(String supplementTarget, Parameters expansionParameters) throws Exception {
     String sct = "http://snomed.info/sct";
     String supplementUrl = "http://example.org/fhir/CodeSystem/sct-supplement";
     SimpleWorkerContext ctxt = new SimpleWorkerContext.SimpleWorkerContextBuilder().fromNothing();
-    ctxt.setExpansionParameters(new Parameters());
+    ctxt.setExpansionParameters(expansionParameters);
     TerminologyCache cache = new TerminologyCache(new Object(), null);
     ctxt.initTxCache(cache);
     CodeSystem supplement = new CodeSystem();
     supplement.setUrl(supplementUrl).setVersion("0.1").setStatus(Enumerations.PublicationStatus.ACTIVE);
-    supplement.setContent(Enumerations.CodeSystemContentMode.SUPPLEMENT).setSupplements(sct);
+    supplement.setContent(Enumerations.CodeSystemContentMode.SUPPLEMENT).setSupplements(supplementTarget);
     ctxt.cacheResource(supplement);
 
     ValueSet vs = new ValueSet();
@@ -868,5 +881,7 @@ public class BaseWorkerContextTests {
 
     assertNull(res.getError());
     assertEquals("22298006", res.getValueset().getExpansion().getContainsFirstRep().getCode());
+    // the supplements are collected in a copy, not in the context's expansion parameters
+    assertFalse(ctxt.getExpansionParameters().hasParameter("tx-resource"));
   }
 }

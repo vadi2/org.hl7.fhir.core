@@ -456,6 +456,11 @@ public class TerminologyCache {
   private Set<String> vsTransient = new HashSet<>();
   private Set<String> csTransient = new HashSet<>();
   private Map<String, String> serverMap = new HashMap<>();
+  /**
+   * The urls {@link #scrub} has removed the entries for in this session. A merge with the cache file on disk leaves
+   * out the disk's entries for them, so that they don't come back with the next save.
+   */
+  private final Set<String> scrubbed = new HashSet<>();
 
   @Getter @Setter private static boolean noCaching;
   @Getter @Setter private static boolean cacheErrors;
@@ -1328,6 +1333,9 @@ public class TerminologyCache {
     }
     Set<CacheEntry> mergedCacheList = new LinkedHashSet<CacheEntry>();
     for (CacheEntry diskEntry : diskCache.list) {
+      if (!scrubbed.isEmpty() && mentionsAny(diskEntry.request, scrubbed)) {
+        continue; // scrubbed in this session: the disk's copy is the answer the scrub removed
+      }
       String key = String.valueOf(hashJson(diskEntry.request));
       CacheEntry memoryEntry = memoryCache.map.get(key);
       if (memoryEntry != null && memoryEntry.persistent) {
@@ -1880,6 +1888,147 @@ public class TerminologyCache {
         caches.remove(name);
       }
     }   
+  }
+
+  /**
+   * Removes every entry whose request names one of these ValueSet or CodeSystem urls, in memory and in the cache
+   * files: the expansions of a ValueSet (for every set of options and every language), validate-code results against
+   * it, and any expansion, validate-code or subsumes result that names one of the urls as a code system or as an
+   * included or excluded ValueSet.
+   *
+   * <p>A ValueSet with a url and a version is keyed by url|version, not by its content. A caller that changes a
+   * ValueSet or CodeSystem without changing its version (an IG being edited) calls this before anything expands or
+   * validates against it again, so that the answers based on the old content are asked again. The caller also passes
+   * the ValueSets that depend on what changed (that include or exclude a changed ValueSet, or include codes from a
+   * changed CodeSystem or one with a changed supplement): an expansion keyed by url|version doesn't name them.
+   *
+   * <p>A url matches a whole url, with or without a |version, and the implicit value sets of a code system
+   * (url?fhir_vs...), and nothing else that merely starts with it. The expansion
+   * parameters in a request are not looked at: they are the same for every request in a run.
+   *
+   * @param urls ValueSet and CodeSystem urls. A |version is ignored: every version of the url is removed
+   * @return how many entries were removed
+   */
+  public int scrub(Collection<String> urls) {
+    Set<String> targets = new HashSet<>();
+    for (String url : urls) {
+      if (url != null && !url.isEmpty()) {
+        targets.add(url.contains("|") ? url.substring(0, url.indexOf('|')) : url);
+      }
+    }
+    if (targets.isEmpty()) {
+      return 0;
+    }
+    synchronized (lock) {
+      checkUsable();
+      scrubbed.addAll(targets);
+      int count = 0;
+      long now = System.currentTimeMillis();
+      for (NamedCache nc : caches.values()) {
+        int removed = 0;
+        // the list can hold a persistent entry whose key a transient entry has taken over in the map, so both are
+        // walked
+        for (Iterator<CacheEntry> it = nc.map.values().iterator(); it.hasNext(); ) {
+          CacheEntry e = it.next();
+          if (mentionsAny(e.request, targets)) {
+            it.remove();
+            nc.list.remove(e);
+            removed++;
+          }
+        }
+        for (Iterator<CacheEntry> it = nc.list.iterator(); it.hasNext(); ) {
+          if (mentionsAny(it.next().request, targets)) {
+            it.remove();
+            removed++;
+          }
+        }
+        if (removed > 0) {
+          count += removed;
+          nc.dirty = true;
+          save(nc, now);
+        }
+      }
+      return count;
+    }
+  }
+
+  private static final String PROFILE_IN_REQUEST = ", \"profile\": ";
+
+  /**
+   * Does this request name one of the urls (each without a |version)? Looks at every JSON string in it, and at the
+   * unquoted url some requests put after "valueSet" :, up to the expansion parameters ("profile"), which come last.
+   * A string matches when it is one of the urls, or one of them followed by |version or by ?fhir_vs (an implicit
+   * value set of a code system).
+   */
+  static boolean mentionsAny(String request, Set<String> urls) {
+    if (request == null) {
+      return false;
+    }
+    int end = request.lastIndexOf(PROFILE_IN_REQUEST);
+    if (end < 0) {
+      end = request.length();
+    }
+    StringBuilder b = new StringBuilder();
+    int i = 0;
+    while (i < end) {
+      char c = request.charAt(i);
+      if (c == '"') {
+        b.setLength(0);
+        i++;
+        while (i < end && request.charAt(i) != '"') {
+          char ch = request.charAt(i);
+          if (ch == '\\' && i + 1 < end) {
+            i++;
+            ch = request.charAt(i);
+            if (ch == 'u' && i + 4 < end) {
+              try {
+                ch = (char) Integer.parseInt(request.substring(i + 1, i + 5), 16);
+                i += 4;
+              } catch (NumberFormatException e) {
+                // not an escape we understand: keep the 'u'
+              }
+            }
+          }
+          b.append(ch);
+          i++;
+        }
+        i++;
+        if (isOneOf(b, urls)) {
+          return true;
+        }
+      } else if (c == ':') {
+        i++;
+        while (i < end && Character.isWhitespace(request.charAt(i))) {
+          i++;
+        }
+        if (i < end && "\"{[".indexOf(request.charAt(i)) < 0) {
+          // an unquoted value: true, false, null, a number, or a url (the "valueSet" of a validation by url)
+          b.setLength(0);
+          while (i < end && ",}]".indexOf(request.charAt(i)) < 0 && !Character.isWhitespace(request.charAt(i))) {
+            b.append(request.charAt(i));
+            i++;
+          }
+          if (isOneOf(b, urls)) {
+            return true;
+          }
+        }
+      } else {
+        i++;
+      }
+    }
+    return false;
+  }
+
+  private static final String IMPLICIT_VALUE_SET = "?fhir_vs";
+
+  /** the value is one of the urls, with or without a |version, or an implicit value set of one (url?fhir_vs...) */
+  private static boolean isOneOf(StringBuilder value, Set<String> urls) {
+    int end = value.indexOf("|");
+    int implicit = value.indexOf(IMPLICIT_VALUE_SET);
+    if (implicit >= 0 && (end < 0 || implicit < end)) {
+      end = implicit;
+    }
+    return urls.contains(end < 0 ? value.toString() : value.substring(0, end));
   }
 
   public String getFolder() {

@@ -1475,6 +1475,8 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       l.add(new Entry("validate by url", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), VS, params())));
       l.add(new Entry("validate by versioned url", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), VS+"|1.0", params())));
       l.add(new Entry("validate in an including value set", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), includingValueSet(VS), params())));
+      // one quote in a display, before the url: the url is still read as a string
+      l.add(new Entry("validate coding with a quote in its display", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setCode("c3").setDisplay("5\" tall"), vs(VS, "1.0"), params())));
       l.add(new Entry("validate transient", 'v', false, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setCode("c2"), vs(VS, "1.0"), params())));
       return l;
     }
@@ -1529,6 +1531,14 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
     private void assertGone(TerminologyCache c, List<Entry> entries, String when) {
       for (Entry e : entries) {
         assertFalse(e.present(c), e.name+" should have been removed "+when);
+      }
+    }
+
+    private void deleteNonces() throws IOException {
+      try (Stream<Path> files = Files.list(folder)) {
+        for (Path p : files.filter(f -> f.toString().endsWith(".nonce")).collect(Collectors.toList())) {
+          Files.delete(p);
+        }
       }
     }
 
@@ -1611,20 +1621,45 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       putAll(writer, unrelatedEntries());
       writer.save();
       // a fresh clone, or a cache written by an older build: no nonce, so the next save merges the file in
-      try (Stream<Path> files = Files.list(folder)) {
-        for (Path p : files.filter(f -> f.toString().endsWith(".nonce")).collect(Collectors.toList())) {
-          Files.delete(p);
-        }
-      }
+      deleteNonces();
       TerminologyCache c = open();
 
       assertEquals(persistentCount(valueSetEntries()), c.scrub(List.of(VS)));
       new Entry("stored after the scrub", 'v', true, t -> t.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setCode("c9"), vs(OTHER_VS, "1.0"), params())).put(c);
+      // the new answer for the scrubbed value set is kept
+      Entry fresh = valueSetEntries().get(0);
+      fresh.put(c);
+      // the file changed again (another process): this save merges too
+      deleteNonces();
       c.save();
 
       TerminologyCache reloaded = open();
-      assertGone(reloaded, valueSetEntries(), "after a merge with the file");
+      assertGone(reloaded, valueSetEntries().subList(1, valueSetEntries().size()), "after a merge with the file");
+      assertPresent(reloaded, List.of(fresh), true, "after a merge with the file");
       assertPresent(reloaded, unrelatedEntries(), true, "after a merge with the file");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void testAFileWhoseCacheRemoveCSTookOutOfMemoryIsScrubbedToo(boolean usedAgain) throws IOException {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+      // the publisher does this for each CodeSystem of the IG while it loads, before it scrubs
+      c.removeCS(CS);
+      if (usedAgain) {
+        // looked up again: the cache is made again, empty, while the file still has the old entries
+        assertFalse(codeSystemEntries().get(0).present(c));
+      }
+
+      c.scrub(List.of(CS));
+      // what the next save, or the next session, would read back
+      c.save();
+
+      assertGone(open(), codeSystemEntries(), "on disk");
+      assertPresent(open(), unrelatedEntries(), true, "on disk");
     }
 
     @Test

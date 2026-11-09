@@ -432,6 +432,11 @@ public class TerminologyCache {
      * top - see {@link #mergeWithDiskCache}.
      */
     private String nonce = null;
+    /**
+     * True when {@link #list} holds everything in the cache file: the cache was loaded from the file, or saved to it.
+     * A cache made again after {@link TerminologyCache#removeCS} starts empty, and the file still has the old entries.
+     */
+    private boolean holdsFile = false;
 
     protected NamedCache(String name) {
       this.name = name;
@@ -1407,6 +1412,7 @@ public class TerminologyCache {
       String nonce = UUID.randomUUID().toString();
       namedCache.nonce = writeNonce(namedCache.name, nonce, ManagedFileAccess.file(target).length()) ? nonce : null;
       saved = true;
+      namedCache.holdsFile = true;
     } catch (Exception e) {
       log.error("error saving "+namedCache.name+": "+e.getMessage(), e);
     }
@@ -1657,6 +1663,7 @@ public class TerminologyCache {
   private void loadNamedCache(String fn) throws IOException {
     NamedCache nc = readNamedCache(fn, fn.substring(0, fn.lastIndexOf(".")));
     if (nc != null) {
+      nc.holdsFile = true;
       caches.put(nc.name, nc);
     }
   }
@@ -1965,8 +1972,60 @@ public class TerminologyCache {
           save(nc, now);
         }
       }
+      count += scrubFilesNotInMemory(targets, now);
       return count;
     }
+  }
+
+  /**
+   * The cache files that the caches in memory don't hold all of: one whose cache {@link #removeCS} took out of memory
+   * (the publisher does that for each CodeSystem of an IG), or one that failed to load. The next save of such a cache,
+   * or the next session, would read the entries back.
+   */
+  private int scrubFilesNotInMemory(Set<String> targets, long now) {
+    if (folder == null) {
+      return 0;
+    }
+    String[] files;
+    try {
+      files = ManagedFileAccess.file(folder).list();
+    } catch (IOException e) {
+      log.error("Unable to list the cache folder to scrub it: "+e.getMessage(), e);
+      return 0;
+    }
+    if (files == null) {
+      return 0;
+    }
+    int count = 0;
+    for (String fn : files) {
+      if (!fn.endsWith(CACHE_FILE_EXTENSION) || fn.equals("validation" + CACHE_FILE_EXTENSION) || isCapabilityCache(fn)) {
+        continue;
+      }
+      String name = fn.substring(0, fn.length() - CACHE_FILE_EXTENSION.length());
+      NamedCache inMemory = caches.get(name);
+      if (inMemory != null && inMemory.holdsFile) {
+        continue;
+      }
+      NamedCache disk = readNamedCache(fn, name);
+      if (disk == null) {
+        continue;
+      }
+      int removed = 0;
+      for (Iterator<CacheEntry> it = disk.list.iterator(); it.hasNext(); ) {
+        if (mentionsAny(it.next().request, targets)) {
+          it.remove();
+          removed++;
+        }
+      }
+      if (removed > 0) {
+        count += removed;
+        // written as it is on disk, less what was removed. It doesn't go in memory: what isn't there was left out on
+        // purpose
+        disk.dirty = true;
+        save(disk, now);
+      }
+    }
+    return count;
   }
 
   private static final String PROFILE_IN_REQUEST = ", \"profile\": ";

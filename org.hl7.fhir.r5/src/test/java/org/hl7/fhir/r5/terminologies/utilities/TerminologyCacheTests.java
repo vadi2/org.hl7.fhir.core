@@ -1654,7 +1654,7 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
         assertFalse(codeSystemEntries().get(0).present(c));
       }
 
-      c.scrub(List.of(CS));
+      assertEquals(persistentCount(codeSystemEntries()), c.scrub(List.of(CS)));
       // what the next save, or the next session, would read back
       c.save();
 

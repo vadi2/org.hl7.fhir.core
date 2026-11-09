@@ -1962,8 +1962,10 @@ public class TerminologyCache {
 
   /**
    * The cache files that the caches in memory don't hold all of: one whose cache {@link #removeCS} took out of memory
-   * (the publisher does that for each CodeSystem of an IG), or one that failed to load. The next save of such a cache,
-   * or the next session, would read the entries back.
+   * (the publisher does that for each CodeSystem of an IG). The next save of such a cache, or the next session, would
+   * read the entries back.
+   *
+   * @return how many entries were removed from files that were written
    */
   private int scrubFilesNotInMemory(Set<String> targets, long now) {
     if (folder == null) {
@@ -2001,11 +2003,13 @@ public class TerminologyCache {
         }
       }
       if (removed > 0) {
-        count += removed;
         // written as it is on disk, less what was removed. It doesn't go in memory: what isn't there was left out on
         // purpose
         disk.dirty = true;
         save(disk, now);
+        if (!disk.dirty) {
+          count += removed;
+        }
       }
     }
     return count;

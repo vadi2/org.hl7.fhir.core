@@ -17,6 +17,7 @@ import org.hl7.fhir.standalone.testing.TestingUtilities;
 import org.hl7.fhir.utilities.filesystem.ManagedFileAccess;
 import org.hl7.fhir.utilities.tests.ResourceLoaderTests;
 import org.hl7.fhir.utilities.validation.ValidationMessage;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -33,11 +34,16 @@ import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -1365,6 +1371,10 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
 
     private Path folder;
 
+    private interface ThrowingRunnable {
+      void run() throws Exception;
+    }
+
     @BeforeEach
     void setUp() throws IOException {
       folder = createTempCacheDirectory();
@@ -1535,6 +1545,38 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       }
     }
 
+    private void assertScrubbed(int removed, TerminologyCache.ScrubResult result) {
+      assertEquals(List.of(), result.getFailed(), "every file read and written");
+      assertEquals(removed, result.getRemoved());
+    }
+
+    /** runs the test with these permissions on the cache files (or the folder); skipped where they don't apply */
+    private void withPermissions(boolean folderItself, String perms, ThrowingRunnable test) throws Exception {
+      Assumptions.assumeTrue(folder.getFileSystem().supportedFileAttributeViews().contains("posix"), "POSIX permissions");
+      List<Path> paths = new ArrayList<>();
+      if (folderItself) {
+        paths.add(folder);
+      } else {
+        try (Stream<Path> files = Files.list(folder)) {
+          files.filter(f -> f.toString().endsWith(".cache")).forEach(paths::add);
+        }
+      }
+      Map<Path, Set<PosixFilePermission>> old = new HashMap<>();
+      try {
+        for (Path p : paths) {
+          old.put(p, Files.getPosixFilePermissions(p));
+          Files.setPosixFilePermissions(p, PosixFilePermissions.fromString(perms));
+        }
+        // root reads and writes regardless
+        Assumptions.assumeFalse(paths.stream().anyMatch(p -> Files.isReadable(p) && Files.isWritable(p)), "permissions not enforced");
+        test.run();
+      } finally {
+        for (Map.Entry<Path, Set<PosixFilePermission>> e : old.entrySet()) {
+          Files.setPosixFilePermissions(e.getKey(), e.getValue());
+        }
+      }
+    }
+
     private int persistentCount(List<Entry> entries) {
       return (int) entries.stream().filter(e -> e.persistent).count();
     }
@@ -1548,7 +1590,7 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       c.save();
       assertPresent(c, valueSetEntries(), false, "before the scrub");
 
-      assertEquals(valueSetEntries().size(), c.scrub(List.of(VS)));
+      assertScrubbed(valueSetEntries().size(), c.scrub(List.of(VS)));
 
       assertGone(c, valueSetEntries(), "in memory");
       assertPresent(c, codeSystemEntries(), false, "in memory");
@@ -1568,7 +1610,7 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       putAll(c, unrelatedEntries());
       c.save();
 
-      assertEquals(codeSystemEntries().size(), c.scrub(List.of(CS)));
+      assertScrubbed(codeSystemEntries().size(), c.scrub(List.of(CS)));
 
       assertGone(c, codeSystemEntries(), "in memory");
       assertPresent(c, valueSetEntries(), false, "in memory");
@@ -1601,7 +1643,7 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       // saved) still holds the persistent one
       new Entry("transient", 'v', false, persistent.token).put(c);
 
-      assertEquals(2, c.scrub(List.of(VS)));
+      assertScrubbed(2, c.scrub(List.of(VS)));
       c.save();
 
       assertGone(open(), List.of(persistent), "on disk");
@@ -1617,7 +1659,7 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       deleteNonces();
       TerminologyCache c = open();
 
-      assertEquals(persistentCount(valueSetEntries()), c.scrub(List.of(VS)));
+      assertScrubbed(persistentCount(valueSetEntries()), c.scrub(List.of(VS)));
       new Entry("stored after the scrub", 'v', true, t -> t.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setCode("c9"), vs(OTHER_VS, "1.0"), params())).put(c);
       // the new answer for the scrubbed value set is kept
       Entry fresh = valueSetEntries().get(0);
@@ -1647,7 +1689,7 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
         assertFalse(codeSystemEntries().get(0).present(c));
       }
 
-      assertEquals(persistentCount(codeSystemEntries()), c.scrub(List.of(CS)));
+      assertScrubbed(persistentCount(codeSystemEntries()), c.scrub(List.of(CS)));
       // what the next save, or the next session, would read back
       c.save();
 
@@ -1656,15 +1698,88 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
     }
 
     @Test
+    void testACacheInMemoryThatCannotBeWrittenIsReported() throws Exception {
+      TerminologyCache c = open();
+      putAll(c, valueSetEntries());
+      putAll(c, unrelatedEntries());
+      c.save();
+
+      withPermissions(true, "r-xr-xr-x", () -> {
+        TerminologyCache.ScrubResult result = c.scrub(List.of(VS));
+
+        // every cache that has entries for the value set
+        assertFalse(result.isComplete());
+        assertEquals(0, result.getRemoved(), "nothing was written");
+        assertGone(c, valueSetEntries(), "in memory");
+      });
+    }
+
+    @Test
+    void testAFileWhoseCacheIsntInMemoryThatCannotBeWrittenIsReported() throws Exception {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+      c.removeCS(CS);
+
+      withPermissions(true, "r-xr-xr-x", () -> {
+        TerminologyCache.ScrubResult result = c.scrub(List.of(CS));
+
+        assertTrue(result.getFailed().stream().anyMatch(n -> n.endsWith("cs-a")), result.getFailed().toString());
+        assertEquals(0, result.getRemoved(), "nothing was written");
+      });
+      assertPresent(open(), codeSystemEntries(), true, "in the file that couldn't be written");
+    }
+
+    @Test
+    void testAFileWhoseCacheIsntInMemoryThatCannotBeReadIsReported() throws Exception {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+      c.removeCS(CS);
+
+      // the caches in memory hold all of their files, so only the file removeCS dropped is read
+      withPermissions(false, "---------", () -> {
+        TerminologyCache.ScrubResult result = c.scrub(List.of(CS));
+
+        assertFalse(result.isComplete());
+        assertEquals(1, result.getFailed().size(), result.getFailed().toString());
+      });
+    }
+
+    @Test
+    void testAFolderThatCannotBeListedIsReported() throws Exception {
+      TerminologyCache c = open();
+      putAll(c, unrelatedEntries());
+      c.save();
+
+      withPermissions(true, "-wx------", () -> assertFalse(c.scrub(List.of(VS)).isComplete()));
+    }
+
+    @Test
+    void testTheFilesOfCachesInMemoryArentReadAgain() throws Exception {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+
+      withPermissions(false, "---------", () -> assertScrubbed(0, c.scrub(List.of("http://example.org/fhir/ValueSet/none"))));
+    }
+
+    @Test
     void testScrubWorksOnAMemoryOnlyCache() throws IOException {
       TerminologyCache c = new TerminologyCache(new Object(), null, TestingUtilities.getSharedWorkerContext());
       putAll(c, valueSetEntries());
       putAll(c, unrelatedEntries());
 
-      assertEquals(valueSetEntries().size(), c.scrub(List.of(VS)));
+      assertScrubbed(valueSetEntries().size(), c.scrub(List.of(VS)));
       assertGone(c, valueSetEntries(), "");
       assertPresent(c, unrelatedEntries(), false, "");
-      assertEquals(0, c.scrub(new ArrayList<>()));
+      assertScrubbed(0, c.scrub(new ArrayList<>()));
     }
   }
 }

@@ -1914,22 +1914,23 @@ public class TerminologyCache {
    * parameters in a request are not looked at: they are the same for every request in a run.
    *
    * @param urls ValueSet and CodeSystem urls. A |version is ignored: every version of the url is removed
-   * @return how many entries were removed
+   * @return how many entries were removed, and the cache files that could not be read or written, which may still hold
+   *   entries for the urls
    */
-  public int scrub(Collection<String> urls) {
+  public ScrubResult scrub(Collection<String> urls) {
     Set<String> targets = new HashSet<>();
     for (String url : urls) {
       if (url != null && !url.isEmpty()) {
         targets.add(url.contains("|") ? url.substring(0, url.indexOf('|')) : url);
       }
     }
+    ScrubResult result = new ScrubResult();
     if (targets.isEmpty()) {
-      return 0;
+      return result;
     }
     synchronized (lock) {
       checkUsable();
       scrubbed.addAll(targets);
-      int count = 0;
       long now = System.currentTimeMillis();
       for (NamedCache nc : caches.values()) {
         int removed = 0;
@@ -1950,13 +1951,36 @@ public class TerminologyCache {
           }
         }
         if (removed > 0) {
-          count += removed;
           nc.dirty = true;
           save(nc, now);
+          if (folder != null && nc.dirty) {
+            result.failed.add(nc.name);
+          } else {
+            result.removed += removed;
+          }
         }
       }
-      count += scrubFilesNotInMemory(targets, now);
-      return count;
+      scrubFilesNotInMemory(targets, now, result);
+      return result;
+    }
+  }
+
+  public static class ScrubResult {
+    private int removed;
+    private final List<String> failed = new ArrayList<>();
+
+    /** how many entries were removed and written */
+    public int getRemoved() {
+      return removed;
+    }
+
+    /** the caches whose file could not be read or written, so it may still hold entries for the urls */
+    public List<String> getFailed() {
+      return failed;
+    }
+
+    public boolean isComplete() {
+      return failed.isEmpty();
     }
   }
 
@@ -1964,24 +1988,22 @@ public class TerminologyCache {
    * The cache files that the caches in memory don't hold all of: one whose cache {@link #removeCS} took out of memory
    * (the publisher does that for each CodeSystem of an IG). The next save of such a cache, or the next session, would
    * read the entries back.
-   *
-   * @return how many entries were removed from files that were written
    */
-  private int scrubFilesNotInMemory(Set<String> targets, long now) {
+  private void scrubFilesNotInMemory(Set<String> targets, long now, ScrubResult result) {
     if (folder == null) {
-      return 0;
+      return;
     }
     String[] files;
     try {
       files = ManagedFileAccess.file(folder).list();
     } catch (IOException e) {
       log.error("Unable to list the cache folder to scrub it: "+e.getMessage(), e);
-      return 0;
+      files = null;
     }
     if (files == null) {
-      return 0;
+      result.failed.add(folder);
+      return;
     }
-    int count = 0;
     for (String fn : files) {
       if (!fn.endsWith(CACHE_FILE_EXTENSION) || fn.equals("validation" + CACHE_FILE_EXTENSION) || isCapabilityCache(fn)) {
         continue;
@@ -1993,6 +2015,7 @@ public class TerminologyCache {
       }
       NamedCache disk = readNamedCache(fn, name);
       if (disk == null) {
+        result.failed.add(name);
         continue;
       }
       int removed = 0;
@@ -2007,12 +2030,13 @@ public class TerminologyCache {
         // purpose
         disk.dirty = true;
         save(disk, now);
-        if (!disk.dirty) {
-          count += removed;
+        if (disk.dirty) {
+          result.failed.add(name);
+        } else {
+          result.removed += removed;
         }
       }
     }
-    return count;
   }
 
   private static final String PROFILE_IN_REQUEST = ", \"profile\": ";

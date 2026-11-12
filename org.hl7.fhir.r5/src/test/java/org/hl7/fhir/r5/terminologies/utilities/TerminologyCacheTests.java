@@ -7,11 +7,16 @@ import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -32,6 +37,7 @@ import org.hl7.fhir.r5.terminologies.expansion.ValueSetExpansionOutcome;
 import org.hl7.fhir.utilities.filesystem.ManagedFileAccess;
 import org.hl7.fhir.utilities.tests.ResourceLoaderTests;
 import org.hl7.fhir.utilities.validation.ValidationMessage;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -1356,6 +1362,431 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
       assertTrue(Files.readAllLines(cacheFile()).get(0).startsWith("-----"),
           "rewriting the file should drop the legacy header");
       assertEquals(2, countPresent(cache(), 0, 2));
+    }
+  }
+
+  /**
+   * {@link TerminologyCache#scrub} removes every kind of entry that names a url, in memory and on disk, and nothing
+   * else: not urls that merely start with it, nor requests whose expansion parameters mention it.
+   */
+  @Nested
+  class Scrub {
+    static final String VS = "http://example.org/fhir/ValueSet/vs-a";
+    static final String CS = "http://example.org/fhir/CodeSystem/cs-a";
+    static final String OTHER_CS = "http://example.org/fhir/CodeSystem/other";
+    static final String OTHER_VS = "http://example.org/fhir/ValueSet/other";
+
+    private Path folder;
+
+    private interface ThrowingRunnable {
+      void run() throws Exception;
+    }
+
+    @BeforeEach
+    void setUp() throws IOException {
+      folder = createTempCacheDirectory();
+    }
+
+    private TerminologyCache open() throws IOException {
+      return new TerminologyCache(new Object(), folder.toString());
+    }
+
+    /** one cache entry: how to make its token, and what kind of answer it holds */
+    private class Entry {
+      final String name;
+      final char kind; // e = expansion, v = validation, s = subsumes
+      final boolean persistent;
+      final java.util.function.Function<TerminologyCache, TerminologyCache.CacheToken> token;
+
+      Entry(String name, char kind, boolean persistent, java.util.function.Function<TerminologyCache, TerminologyCache.CacheToken> token) {
+        this.name = name;
+        this.kind = kind;
+        this.persistent = persistent;
+        this.token = token;
+      }
+
+      void put(TerminologyCache c) {
+        TerminologyCache.CacheToken t = token.apply(c);
+        if (kind == 'e') {
+          c.cacheExpansion(t, new ValueSetExpansionOutcome(new ValueSet().setUrl("urn:expansion:"+name)), persistent);
+        } else if (kind == 'v') {
+          c.cacheValidation(t, new ValidationResult(ValidationMessage.IssueSeverity.INFORMATION, name, null), persistent);
+        } else {
+          c.cacheSubsumes(t, true, persistent);
+        }
+      }
+
+      boolean present(TerminologyCache c) {
+        TerminologyCache.CacheToken t = token.apply(c);
+        if (kind == 'e') {
+          return c.getExpansion(t) != null;
+        } else if (kind == 'v') {
+          return c.getValidation(t) != null;
+        } else {
+          return c.getSubsumes(t) != null;
+        }
+      }
+    }
+
+    private ValueSet vs(String url, String version) {
+      ValueSet vs = new ValueSet();
+      vs.setUrl(url);
+      vs.setVersion(version);
+      vs.getCompose().addInclude().setSystem(OTHER_CS);
+      return vs;
+    }
+
+    /** a ValueSet with no url, which is keyed by its content: these include the url */
+    private ValueSet includingValueSet(String url) {
+      ValueSet vs = new ValueSet();
+      vs.getCompose().addInclude().addValueSet(url);
+      return vs;
+    }
+
+    private ValueSet includingSystem(String system, String version) {
+      ValueSet vs = new ValueSet();
+      vs.getCompose().addInclude().setSystem(system).setVersion(version);
+      return vs;
+    }
+
+    private Coding coding(String system) {
+      return new Coding().setSystem(system).setCode("c1");
+    }
+
+    private CodeableConcept concept(String system) {
+      return new CodeableConcept().addCoding(coding(system));
+    }
+
+    private Parameters params() {
+      return new Parameters();
+    }
+
+    /** expansion parameters that mention the urls: the same for every request of a run, so not a match */
+    private Parameters paramsMentioning() {
+      Parameters p = new Parameters();
+      p.addParameter("system-version", new org.hl7.fhir.r5.model.UriType(CS+"|2"));
+      p.addParameter("default-valueset-version", new org.hl7.fhir.r5.model.UriType(VS+"|1.0"));
+      return p;
+    }
+
+    private List<Entry> valueSetEntries() {
+      List<Entry> l = new ArrayList<>();
+      l.add(new Entry("expand url|version", 'e', true, c -> c.generateExpandToken(vs(VS, "1.0"), new ExpansionOptions())));
+      l.add(new Entry("expand hierarchical, language", 'e', true, c -> c.generateExpandToken(vs(VS, "1.0"), new ExpansionOptions(true, true, 0, false, "uz"))));
+      l.add(new Entry("expand other version", 'e', true, c -> c.generateExpandToken(vs(VS, "2.0"), new ExpansionOptions())));
+      l.add(new Entry("expand by url", 'e', true, c -> c.generateExpandToken(VS, new ExpansionOptions())));
+      l.add(new Entry("expand by versioned url", 'e', true, c -> c.generateExpandToken(VS+"|1.0", new ExpansionOptions())));
+      l.add(new Entry("expand an including value set", 'e', true, c -> c.generateExpandToken(includingValueSet(VS), new ExpansionOptions())));
+      l.add(new Entry("expand transient", 'e', false, c -> c.generateExpandToken(vs(VS, "1.0"), new ExpansionOptions(false, true, 0, false, "ru"))));
+      l.add(new Entry("validate coding", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), vs(VS, "1.0"), params())));
+      l.add(new Entry("validate coding at $", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), vs(VS, "1.0"), params(), "$")));
+      l.add(new Entry("validate coding, unversioned", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), vs(VS, null), params())));
+      l.add(new Entry("validate concept", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, concept(OTHER_CS), vs(VS, "1.0"), params())));
+      l.add(new Entry("validate by url", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), VS, params())));
+      l.add(new Entry("validate by versioned url", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), VS+"|1.0", params())));
+      l.add(new Entry("validate in an including value set", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), includingValueSet(VS), params())));
+      // one quote in a display, before the url: the url is still read as a string
+      l.add(new Entry("validate coding with a quote in its display", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setCode("c3").setDisplay("5\" tall"), vs(VS, "1.0"), params())));
+      l.add(new Entry("validate transient", 'v', false, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setCode("c2"), vs(VS, "1.0"), params())));
+      return l;
+    }
+
+    private List<Entry> codeSystemEntries() {
+      List<Entry> l = new ArrayList<>();
+      l.add(new Entry("validate code system only", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(CS), (ValueSet) null, params())));
+      l.add(new Entry("validate code system version", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(CS).setVersion("2"), (ValueSet) null, params())));
+      l.add(new Entry("validate against another value set", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(CS), vs(OTHER_VS, "1.0"), params())));
+      l.add(new Entry("validate concept", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, concept(CS), vs(OTHER_VS, "1.0"), params())));
+      l.add(new Entry("expand an include", 'e', true, c -> c.generateExpandToken(includingSystem(CS, "2"), new ExpansionOptions())));
+      l.add(new Entry("subsumes", 's', true, c -> c.generateSubsumesToken(CacheTestUtils.validationOptions, coding(CS), coding(CS).setCode("c2"), params())));
+      l.add(new Entry("expand an implicit value set", 'e', true, c -> c.generateExpandToken(CS+"?fhir_vs=isa/c1", new ExpansionOptions())));
+      return l;
+    }
+
+    /** entries that must survive a scrub of VS and CS */
+    private List<Entry> unrelatedEntries() {
+      List<Entry> l = new ArrayList<>();
+      for (String url : new String[] {VS+"b", VS+"/x", VS.substring(0, VS.length()-2), "x"+VS, OTHER_VS}) {
+        l.add(new Entry("expand "+url, 'e', true, c -> c.generateExpandToken(vs(url, "1.0"), new ExpansionOptions())));
+        l.add(new Entry("expand by url "+url, 'e', true, c -> c.generateExpandToken(url, new ExpansionOptions())));
+        l.add(new Entry("validate "+url, 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), vs(url, "1.0"), params())));
+        l.add(new Entry("validate by url "+url, 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), url, params())));
+        l.add(new Entry("expand including "+url, 'e', true, c -> c.generateExpandToken(includingValueSet(url), new ExpansionOptions())));
+      }
+      for (String system : new String[] {CS+"-b", CS+"/x", CS.substring(0, CS.length()-2), OTHER_CS}) {
+        l.add(new Entry("validate code from "+system, 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(system), (ValueSet) null, params())));
+        l.add(new Entry("subsumes in "+system, 's', true, c -> c.generateSubsumesToken(CacheTestUtils.validationOptions, coding(system), coding(system).setCode("c2"), params())));
+        l.add(new Entry("expand include of "+system, 'e', true, c -> c.generateExpandToken(includingSystem(system, "2"), new ExpansionOptions())));
+        l.add(new Entry("expand an implicit value set of "+system, 'e', true, c -> c.generateExpandToken(system+"?fhir_vs", new ExpansionOptions())));
+      }
+      l.add(new Entry("parameters mention them", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), vs(OTHER_VS, "1.0"), paramsMentioning())));
+      l.add(new Entry("a display that is the url", 'v', true, c -> c.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setDisplay("see "+VS), vs(OTHER_VS, "1.0"), params())));
+      return l;
+    }
+
+    private void putAll(TerminologyCache c, List<Entry> entries) {
+      for (Entry e : entries) {
+        e.put(c);
+      }
+    }
+
+    private void assertPresent(TerminologyCache c, List<Entry> entries, boolean persistentOnly, String when) {
+      for (Entry e : entries) {
+        if (e.persistent || !persistentOnly) {
+          assertTrue(e.present(c), e.name+" should still be cached "+when);
+        }
+      }
+    }
+
+    private void assertGone(TerminologyCache c, List<Entry> entries, String when) {
+      for (Entry e : entries) {
+        assertFalse(e.present(c), e.name+" should have been removed "+when);
+      }
+    }
+
+    private void deleteNonces() throws IOException {
+      try (Stream<Path> files = Files.list(folder)) {
+        for (Path p : files.filter(f -> f.toString().endsWith(".nonce")).collect(Collectors.toList())) {
+          Files.delete(p);
+        }
+      }
+    }
+
+    private void assertScrubbed(int removed, TerminologyCache.ScrubResult result) {
+      assertEquals(List.of(), result.getFailed(), "every file read and written");
+      assertEquals(removed, result.getRemoved());
+    }
+
+    /** runs the test with these permissions on the cache files (or the folder); skipped where they don't apply */
+    private void withPermissions(boolean folderItself, String perms, ThrowingRunnable test) throws Exception {
+      Assumptions.assumeTrue(folder.getFileSystem().supportedFileAttributeViews().contains("posix"), "POSIX permissions");
+      List<Path> paths = new ArrayList<>();
+      if (folderItself) {
+        paths.add(folder);
+      } else {
+        try (Stream<Path> files = Files.list(folder)) {
+          files.filter(f -> f.toString().endsWith(".cache")).forEach(paths::add);
+        }
+      }
+      Map<Path, Set<PosixFilePermission>> old = new HashMap<>();
+      try {
+        for (Path p : paths) {
+          old.put(p, Files.getPosixFilePermissions(p));
+          Files.setPosixFilePermissions(p, PosixFilePermissions.fromString(perms));
+        }
+        // root reads and writes regardless
+        Assumptions.assumeFalse(paths.stream().anyMatch(p -> Files.isReadable(p) && Files.isWritable(p)), "permissions not enforced");
+        test.run();
+      } finally {
+        for (Map.Entry<Path, Set<PosixFilePermission>> e : old.entrySet()) {
+          Files.setPosixFilePermissions(e.getKey(), e.getValue());
+        }
+      }
+    }
+
+    private int persistentCount(List<Entry> entries) {
+      return (int) entries.stream().filter(e -> e.persistent).count();
+    }
+
+    @Test
+    void testScrubRemovesEveryEntryForAValueSetInMemoryAndOnDisk() throws IOException {
+      TerminologyCache c = open();
+      putAll(c, valueSetEntries());
+      putAll(c, codeSystemEntries());
+      putAll(c, unrelatedEntries());
+      c.save();
+      assertPresent(c, valueSetEntries(), false, "before the scrub");
+
+      assertScrubbed(valueSetEntries().size(), c.scrub(List.of(VS)));
+
+      assertGone(c, valueSetEntries(), "in memory");
+      assertPresent(c, codeSystemEntries(), false, "in memory");
+      assertPresent(c, unrelatedEntries(), false, "in memory");
+
+      TerminologyCache reloaded = open();
+      assertGone(reloaded, valueSetEntries(), "on disk");
+      assertPresent(reloaded, codeSystemEntries(), true, "on disk");
+      assertPresent(reloaded, unrelatedEntries(), true, "on disk");
+    }
+
+    @Test
+    void testScrubRemovesEveryEntryForACodeSystemInMemoryAndOnDisk() throws IOException {
+      TerminologyCache c = open();
+      putAll(c, valueSetEntries());
+      putAll(c, codeSystemEntries());
+      putAll(c, unrelatedEntries());
+      c.save();
+
+      assertScrubbed(codeSystemEntries().size(), c.scrub(List.of(CS)));
+
+      assertGone(c, codeSystemEntries(), "in memory");
+      assertPresent(c, valueSetEntries(), false, "in memory");
+      assertPresent(c, unrelatedEntries(), false, "in memory");
+
+      TerminologyCache reloaded = open();
+      assertGone(reloaded, codeSystemEntries(), "on disk");
+      assertPresent(reloaded, valueSetEntries(), true, "on disk");
+      assertPresent(reloaded, unrelatedEntries(), true, "on disk");
+    }
+
+    @Test
+    void testAVersionOnTheUrlIsIgnored() throws IOException {
+      TerminologyCache c = open();
+      putAll(c, valueSetEntries());
+      putAll(c, unrelatedEntries());
+
+      c.scrub(List.of(VS+"|3.0"));
+
+      assertGone(c, valueSetEntries(), "for any version");
+      assertPresent(c, unrelatedEntries(), false, "");
+    }
+
+    @Test
+    void testAPersistentEntryWhoseKeyATransientEntryTookOverIsRemovedToo() throws IOException {
+      TerminologyCache c = open();
+      Entry persistent = new Entry("persistent", 'v', true, t -> t.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS), vs(VS, "1.0"), params()));
+      persistent.put(c);
+      // the same request answered again for this run only: the map holds the transient answer, the list (what is
+      // saved) still holds the persistent one
+      new Entry("transient", 'v', false, persistent.token).put(c);
+
+      assertScrubbed(2, c.scrub(List.of(VS)));
+      c.save();
+
+      assertGone(open(), List.of(persistent), "on disk");
+    }
+
+    @Test
+    void testScrubbedEntriesDontComeBackWhenTheFileHasToBeMerged() throws IOException {
+      TerminologyCache writer = open();
+      putAll(writer, valueSetEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      // a fresh clone, or a cache written by an older build: no nonce, so the next save merges the file in
+      deleteNonces();
+      TerminologyCache c = open();
+
+      assertScrubbed(persistentCount(valueSetEntries()), c.scrub(List.of(VS)));
+      new Entry("stored after the scrub", 'v', true, t -> t.generateValidationToken(CacheTestUtils.validationOptions, coding(OTHER_CS).setCode("c9"), vs(OTHER_VS, "1.0"), params())).put(c);
+      // the new answer for the scrubbed value set is kept
+      Entry fresh = valueSetEntries().get(0);
+      fresh.put(c);
+      // the file changed again (another process): this save merges too
+      deleteNonces();
+      c.save();
+
+      TerminologyCache reloaded = open();
+      assertGone(reloaded, valueSetEntries().subList(1, valueSetEntries().size()), "after a merge with the file");
+      assertPresent(reloaded, List.of(fresh), true, "after a merge with the file");
+      assertPresent(reloaded, unrelatedEntries(), true, "after a merge with the file");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void testAFileWhoseCacheRemoveCSTookOutOfMemoryIsScrubbedToo(boolean usedAgain) throws IOException {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+      // the publisher does this for each CodeSystem of the IG while it loads, before it scrubs
+      c.removeCS(CS);
+      if (usedAgain) {
+        // looked up again: the cache is made again, empty, while the file still has the old entries
+        assertFalse(codeSystemEntries().get(0).present(c));
+      }
+
+      assertScrubbed(persistentCount(codeSystemEntries()), c.scrub(List.of(CS)));
+      // what the next save, or the next session, would read back
+      c.save();
+
+      assertGone(open(), codeSystemEntries(), "on disk");
+      assertPresent(open(), unrelatedEntries(), true, "on disk");
+    }
+
+    @Test
+    void testACacheInMemoryThatCannotBeWrittenIsReported() throws Exception {
+      TerminologyCache c = open();
+      putAll(c, valueSetEntries());
+      putAll(c, unrelatedEntries());
+      c.save();
+
+      withPermissions(true, "r-xr-xr-x", () -> {
+        TerminologyCache.ScrubResult result = c.scrub(List.of(VS));
+
+        // every cache that has entries for the value set
+        assertFalse(result.isComplete());
+        assertEquals(0, result.getRemoved(), "nothing was written");
+        assertGone(c, valueSetEntries(), "in memory");
+      });
+    }
+
+    @Test
+    void testAFileWhoseCacheIsntInMemoryThatCannotBeWrittenIsReported() throws Exception {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+      c.removeCS(CS);
+
+      withPermissions(true, "r-xr-xr-x", () -> {
+        TerminologyCache.ScrubResult result = c.scrub(List.of(CS));
+
+        assertTrue(result.getFailed().stream().anyMatch(n -> n.endsWith("cs-a")), result.getFailed().toString());
+        assertEquals(0, result.getRemoved(), "nothing was written");
+      });
+      assertPresent(open(), codeSystemEntries(), true, "in the file that couldn't be written");
+    }
+
+    @Test
+    void testAFileWhoseCacheIsntInMemoryThatCannotBeReadIsReported() throws Exception {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+      c.removeCS(CS);
+
+      // the caches in memory hold all of their files, so only the file removeCS dropped is read
+      withPermissions(false, "---------", () -> {
+        TerminologyCache.ScrubResult result = c.scrub(List.of(CS));
+
+        assertFalse(result.isComplete());
+        assertEquals(1, result.getFailed().size(), result.getFailed().toString());
+      });
+    }
+
+    @Test
+    void testAFolderThatCannotBeListedIsReported() throws Exception {
+      TerminologyCache c = open();
+      putAll(c, unrelatedEntries());
+      c.save();
+
+      withPermissions(true, "-wx------", () -> assertFalse(c.scrub(List.of(VS)).isComplete()));
+    }
+
+    @Test
+    void testTheFilesOfCachesInMemoryArentReadAgain() throws Exception {
+      TerminologyCache writer = open();
+      putAll(writer, codeSystemEntries());
+      putAll(writer, unrelatedEntries());
+      writer.save();
+      TerminologyCache c = open();
+
+      withPermissions(false, "---------", () -> assertScrubbed(0, c.scrub(List.of("http://example.org/fhir/ValueSet/none"))));
+    }
+
+    @Test
+    void testScrubWorksOnAMemoryOnlyCache() throws IOException {
+      TerminologyCache c = new TerminologyCache(new Object(), null);
+      putAll(c, valueSetEntries());
+      putAll(c, unrelatedEntries());
+
+      assertScrubbed(valueSetEntries().size(), c.scrub(List.of(VS)));
+      assertGone(c, valueSetEntries(), "");
+      assertPresent(c, unrelatedEntries(), false, "");
+      assertScrubbed(0, c.scrub(new ArrayList<>()));
     }
   }
 }
